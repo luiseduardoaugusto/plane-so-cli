@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+plane-so-cli - Clean CLI for Plane.so API
+Zero dependencies, Python 3.8+ stdlib only.
+
+Environment variables required:
+  PLANE_API_KEY   - Your Plane personal access token
+  PLANE_WORKSPACE - Your workspace slug
+"""
+
+import os
+import sys
+import json
+import argparse
+from html import escape as html_escape
+from typing import Optional, List, Dict, Any
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+
+# Configuration
+API_KEY = os.environ.get("PLANE_API_KEY")
+WORKSPACE = os.environ.get("PLANE_WORKSPACE")
+BASE_URL = os.environ.get("PLANE_BASE_URL", "https://api.plane.so")
+
+# Colors
+_COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR_ENABLED else text
+
+def dim(text: str) -> str: return _c("2", text)
+def bold(text: str) -> str: return _c("1", text)
+def red(text: str) -> str: return _c("31", text)
+def green(text: str) -> str: return _c("32", text)
+def yellow(text: str) -> str: return _c("33", text)
+def cyan(text: str) -> str: return _c("36", text)
+
+def _check_env():
+    if not API_KEY:
+        print(red("Error: PLANE_API_KEY not set"), file=sys.stderr)
+        sys.exit(1)
+    if not WORKSPACE:
+        print(red("Error: PLANE_WORKSPACE not set"), file=sys.stderr)
+        sys.exit(1)
+
+def _validate_id(value: str, name: str = "ID") -> str:
+    if "/" in value or "\\" in value or ".." in value:
+        print(red(f"Invalid {name}: contains illegal characters"), file=sys.stderr)
+        sys.exit(1)
+    return value
+
+def api(method: str, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """Make authenticated request to Plane API."""
+    _check_env()
+    url = f"{BASE_URL}/api/v1{endpoint}"
+    
+    if not url.startswith(("http://", "https://")):
+        print(red(f"Invalid URL: {url}"), file=sys.stderr)
+        sys.exit(1)
+    
+    headers = {"X-API-Key": API_KEY, "Content-Type": "application/json", "User-Agent": "plane-so-cli/1.0"}
+    body = json.dumps(data).encode() if data else None
+    req = Request(url, data=body, headers=headers, method=method)
+    
+    try:
+        with urlopen(req, timeout=30) as resp:
+            if resp.status == 204:
+                return None
+            return json.loads(resp.read().decode())
+    except HTTPError as e:
+        error_body = e.read().decode() if e.fp else str(e)
+        try:
+            err = json.loads(error_body)
+            error_body = json.dumps(err, indent=2)
+        except:
+            pass
+        print(red(f"API Error {e.code}: {error_body}"), file=sys.stderr)
+        sys.exit(1)
+    except URLError as e:
+        print(red(f"Connection error: {e.reason}"), file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print(red("Request timed out"), file=sys.stderr)
+        sys.exit(1)
+
+def _resolve(val) -> str:
+    if isinstance(val, dict):
+        return val.get("name", val.get("display_name", val.get("id", str(val))))
+    if val is None:
+        return "—"
+    return str(val)
+
+def _truncate(text: str, width: int) -> str:
+    return text[:width-1] + "…" if len(text) > width else text
+
+def _priority_str(val) -> str:
+    labels = {0: "none", 1: "urgent", 2: "high", 3: "medium", 4: "low"}
+    colors = {
+        "urgent": lambda t: _c("1;31", t),
+        "high": lambda t: _c("31", t),
+        "medium": lambda t: _c("33", t),
+        "low": lambda t: _c("34", t),
+        "none": dim
+    }
+    label = labels.get(val, str(val)) if isinstance(val, int) else (val or "none")
+    return colors.get(label, str)(label)
+
+def _print_table(rows: List[Dict], columns: List[tuple]):
+    if not rows:
+        print(dim("No results."))
+        return
+    
+    header = [h for _, h, _ in columns]
+    lines = []
+    raw_lines = []
+    
+    for row in rows:
+        cells = []
+        raw_cells = []
+        for key, _, maxw in columns:
+            if key == "priority":
+                label = _priority_str(row.get(key))
+                raw = str(row.get(key)) if row.get(key) is not None else "none"
+                cells.append(label)
+                raw_cells.append(raw)
+            else:
+                val = _truncate(_resolve(row.get(key)), maxw)
+                cells.append(val)
+                raw_cells.append(val)
+        lines.append(cells)
+        raw_lines.append(raw_cells)
+    
+    widths = [len(h) for h in header]
+    for raw in raw_lines:
+        for i, cell in enumerate(raw):
+            widths[i] = max(widths[i], len(cell))
+    for i, (_, _, maxw) in enumerate(columns):
+        widths[i] = min(widths[i], maxw)
+    
+    print("  ".join(bold(h.ljust(w)) for h, w in zip(header, widths)))
+    print(dim("─" * (sum(widths) + 2 * (len(widths) - 1))))
+    
+    for cells, raw in zip(lines, raw_lines):
+        parts = []
+        for i, (cell, rc) in enumerate(zip(cells, raw)):
+            pad = widths[i] - len(rc)
+            parts.append(cell + " " * max(pad, 0))
+        print("  ".join(parts))
+
+def format_output(data, fmt: str = "table"):
+    if fmt == "json":
+        print(json.dumps(data, indent=2))
+        return
+    
+    if isinstance(data, dict):
+        if data.get("next") or data.get("next_cursor"):
+            print(yellow("⚠ More results available"), file=sys.stderr)
+        if "results" in data:
+            data = data["results"]
+    
+    if isinstance(data, list):
+        if not data:
+            print(dim("No results."))
+            return
+        sample = data[0]
+        if "identifier" in sample and "name" in sample:
+            _print_table(data, [("identifier", "ID", 10), ("name", "NAME", 40), ("id", "UUID", 36)])
+        elif "name" in sample and "priority" in sample:
+            _print_table(data, [("sequence_id", "SEQ", 8), ("name", "NAME", 45), ("priority", "PRI", 8), ("state", "STATE", 20)])
+        elif "display_name" in sample:
+            _print_table(data, [("display_name", "NAME", 30), ("email", "EMAIL", 35), ("role", "ROLE", 10)])
+        elif "start_date" in sample:
+            _print_table(data, [("name", "NAME", 35), ("start_date", "START", 12), ("end_date", "END", 12)])
+        else:
+            for item in data:
+                print(json.dumps(item, indent=2))
+    elif isinstance(data, dict):
+        max_key = max((len(k) for k in data if not k.startswith("_")), default=0)
+        for k, v in data.items():
+            if k.startswith("_"):
+                continue
+            print(f"  {bold(k.ljust(max_key))}  {_resolve(v)}")
+
+# Commands
+def cmd_me(args):
+    data = api("GET", "/users/me/")
+    format_output(data, args.format)
+
+def cmd_projects_list(args):
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/")
+    if isinstance(data, dict) and "results" in data:
+        data["results"] = [p for p in data["results"] if p.get("archived_at") is None]
+    elif isinstance(data, list):
+        data = [p for p in data if p.get("archived_at") is None]
+    format_output(data, args.format)
+
+def cmd_members(args):
+    data = api("GET", f"/workspaces/{WORKSPACE}/members/")
+    format_output(data, args.format)
+
+def cmd_issues_list(args):
+    _validate_id(args.project, "project ID")
+    endpoint = f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/"
+    params = {}
+    if args.state: params["state"] = args.state
+    if args.priority: params["priority"] = args.priority
+    if args.assignee: params["assignees"] = args.assignee
+    if params: endpoint += "?" + urlencode(params)
+    data = api("GET", endpoint)
+    format_output(data, args.format)
+
+def cmd_issues_get(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/")
+    format_output(data, args.format)
+
+def cmd_issues_create(args):
+    _validate_id(args.project, "project ID")
+    payload = {"name": args.name}
+    if args.description:
+        payload["description_html"] = f"<p>{html_escape(args.description)}</p>"
+    if args.priority:
+        priorities = {"urgent": 1, "high": 2, "medium": 3, "low": 4, "none": 0}
+        payload["priority"] = priorities.get(args.priority.lower(), 3)
+    if args.state: payload["state"] = args.state
+    if args.assignee: payload["assignees"] = [args.assignee]
+    if args.label: payload["labels"] = [args.label]
+    data = api("POST", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/", payload)
+    print(green("✓ Issue created"))
+    format_output(data, args.format)
+
+def cmd_issues_update(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    payload = {}
+    if args.name: payload["name"] = args.name
+    if args.description: payload["description_html"] = f"<p>{html_escape(args.description)}</p>"
+    if args.priority:
+        priorities = {"urgent": 1, "high": 2, "medium": 3, "low": 4, "none": 0}
+        payload["priority"] = priorities.get(args.priority.lower(), 3)
+    if args.state: payload["state"] = args.state
+    if not payload:
+        print(yellow("Nothing to update"), file=sys.stderr)
+        sys.exit(1)
+    data = api("PATCH", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/", payload)
+    print(green("✓ Issue updated"))
+    format_output(data, args.format)
+
+def cmd_issues_assign(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    for assignee in args.assignees:
+        _validate_id(assignee, "assignee ID")
+    payload = {"assignees": args.assignees}
+    data = api("PATCH", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/", payload)
+    print(green(f"✓ Assigned to {len(args.assignees)} member(s)"))
+    format_output(data, args.format)
+
+def cmd_issues_delete(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    api("DELETE", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/")
+    print(green(f"✓ Deleted issue {args.issue}"))
+
+def cmd_issues_search(args):
+    params = urlencode({"search": args.query, "type": "work_item"})
+    data = api("GET", f"/workspaces/{WORKSPACE}/search/?{params}")
+    format_output(data, args.format)
+
+def cmd_issues_my(args):
+    me = api("GET", "/users/me/")
+    my_id = me.get("id") if isinstance(me, dict) else None
+    if not my_id:
+        print(red("Could not get current user ID"), file=sys.stderr)
+        sys.exit(1)
+    
+    projects_data = api("GET", f"/workspaces/{WORKSPACE}/projects/")
+    if isinstance(projects_data, dict) and "results" in projects_data:
+        projects = projects_data["results"]
+    elif isinstance(projects_data, list):
+        projects = projects_data
+    else:
+        projects = []
+    
+    all_issues = []
+    for proj in projects:
+        if proj.get("archived_at"):
+            continue
+        proj_id = proj.get("id")
+        try:
+            issues = api("GET", f"/workspaces/{WORKSPACE}/projects/{proj_id}/work-items/?assignees={my_id}")
+            if isinstance(issues, dict) and "results" in issues:
+                for issue in issues["results"]:
+                    issue["project_id"] = proj.get("identifier", proj_id)
+                all_issues.extend(issues["results"])
+            elif isinstance(issues, list):
+                for issue in issues:
+                    issue["project_id"] = proj.get("identifier", proj_id)
+                all_issues.extend(issues)
+        except:
+            pass
+    
+    if not all_issues:
+        print(dim("No issues assigned to you."))
+        return
+    
+    priority_order = {1: 0, 2: 1, 3: 2, 4: 3, 0: 4, None: 5}
+    all_issues.sort(key=lambda x: priority_order.get(x.get("priority"), 99))
+    
+    print(f"\n{bold('Issues assigned to you:')}\n")
+    _print_table(all_issues, [
+        ("project_id", "PROJECT", 10),
+        ("sequence_id", "SEQ", 6),
+        ("name", "NAME", 40),
+        ("priority", "PRI", 8),
+        ("state", "STATE", 20)
+    ])
+
+def cmd_comments_list(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/activities/")
+    if isinstance(data, dict) and "results" in data:
+        items = data["results"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    
+    if args.format == "json":
+        print(json.dumps(items, indent=2))
+        return
+    
+    if not items:
+        print(dim("No activity."))
+        return
+    
+    for item in items:
+        actor = _resolve(item.get("actor_detail", item.get("actor", "?")))
+        created = str(item.get("created_at", ""))[:19]
+        field = item.get("field", "")
+        if field == "comment":
+            comment = item.get("comment", "")
+            print(f"  {bold(actor)}  {dim(created)}")
+            print(f"    {comment}")
+            print()
+        elif args.all:
+            verb = item.get("verb", "changed")
+            print(f"  {dim(created)}  {actor} {verb} {field}")
+
+def cmd_comments_add(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.issue, "issue ID")
+    payload = {"comment_html": f"<p>{html_escape(args.body)}</p>"}
+    data = api("POST", f"/workspaces/{WORKSPACE}/projects/{args.project}/work-items/{args.issue}/activities/", payload)
+    print(green("✓ Comment added"))
+    if data and args.format == "json":
+        print(json.dumps(data, indent=2))
+
+def cmd_states(args):
+    _validate_id(args.project, "project ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/states/")
+    format_output(data, args.format)
+
+def cmd_labels(args):
+    _validate_id(args.project, "project ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/labels/")
+    format_output(data, args.format)
+
+def cmd_cycles_list(args):
+    _validate_id(args.project, "project ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/cycles/")
+    format_output(data, args.format)
+
+def cmd_cycles_get(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.cycle, "cycle ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/cycles/{args.cycle}/")
+    format_output(data, args.format)
+
+def cmd_modules_list(args):
+    _validate_id(args.project, "project ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/modules/")
+    format_output(data, args.format)
+
+def cmd_modules_get(args):
+    _validate_id(args.project, "project ID")
+    _validate_id(args.module, "module ID")
+    data = api("GET", f"/workspaces/{WORKSPACE}/projects/{args.project}/modules/{args.module}/")
+    format_output(data, args.format)
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="plane-so-cli",
+        description="Clean CLI for Plane.so",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-f", "--format", choices=["table", "json"], default="table", help="Output format")
+    subparsers = parser.add_subparsers(dest="command")
+    
+    me_p = subparsers.add_parser("me", help="Show current user")
+    me_p.set_defaults(func=cmd_me)
+    
+    mem_p = subparsers.add_parser("members", help="List workspace members")
+    mem_p.set_defaults(func=cmd_members)
+    
+    proj = subparsers.add_parser("projects", help="Manage projects")
+    proj_sub = proj.add_subparsers(dest="subcommand")
+    p_list = proj_sub.add_parser("list", help="List projects")
+    p_list.set_defaults(func=cmd_projects_list)
+    
+    iss = subparsers.add_parser("issues", help="Manage issues")
+    iss_sub = iss.add_subparsers(dest="subcommand")
+    
+    i_list = iss_sub.add_parser("list", help="List issues")
+    i_list.add_argument("-p", "--project", required=True, help="Project ID")
+    i_list.add_argument("--state", help="Filter by state ID")
+    i_list.add_argument("--priority", choices=["urgent", "high", "medium", "low", "none"])
+    i_list.add_argument("--assignee", help="Filter by assignee ID")
+    i_list.set_defaults(func=cmd_issues_list)
+    
+    i_get = iss_sub.add_parser("get", help="Get issue details")
+    i_get.add_argument("-p", "--project", required=True, help="Project ID")
+    i_get.add_argument("issue", help="Issue ID")
+    i_get.set_defaults(func=cmd_issues_get)
+    
+    i_create = iss_sub.add_parser("create", help="Create issue")
+    i_create.add_argument("-p", "--project", required=True, help="Project ID")
+    i_create.add_argument("--name", required=True, help="Issue title")
+    i_create.add_argument("--description", help="Description")
+    i_create.add_argument("--priority", choices=["urgent", "high", "medium", "low", "none"])
+    i_create.add_argument("--state", help="State ID")
+    i_create.add_argument("--assignee", help="Assignee ID")
+    i_create.add_argument("--label", help="Label ID")
+    i_create.set_defaults(func=cmd_issues_create)
+    
+    i_update = iss_sub.add_parser("update", help="Update issue")
+    i_update.add_argument("-p", "--project", required=True, help="Project ID")
+    i_update.add_argument("issue", help="Issue ID")
+    i_update.add_argument("--name", help="New title")
+    i_update.add_argument("--description", help="New description")
+    i_update.add_argument("--priority", choices=["urgent", "high", "medium", "low", "none"])
+    i_update.add_argument("--state", help="State ID")
+    i_update.set_defaults(func=cmd_issues_update)
+    
+    i_assign = iss_sub.add_parser("assign", help="Assign issue")
+    i_assign.add_argument("-p", "--project", required=True, help="Project ID")
+    i_assign.add_argument("issue", help="Issue ID")
+    i_assign.add_argument("assignees", nargs="+", help="Assignee IDs")
+    i_assign.set_defaults(func=cmd_issues_assign)
+    
+    i_delete = iss_sub.add_parser("delete", help="Delete issue")
+    i_delete.add_argument("-p", "--project", required=True, help="Project ID")
+    i_delete.add_argument("issue", help="Issue ID")
+    i_delete.set_defaults(func=cmd_issues_delete)
+    
+    i_search = iss_sub.add_parser("search", help="Search issues")
+    i_search.add_argument("query", help="Search query")
+    i_search.set_defaults(func=cmd_issues_search)
+    
+    i_my = iss_sub.add_parser("my", help="My assigned issues")
+    i_my.set_defaults(func=cmd_issues_my)
+    
+    cmt = subparsers.add_parser("comments", help="Manage comments")
+    cmt_sub = cmt.add_subparsers(dest="subcommand")
+    
+    c_list = cmt_sub.add_parser("list", help="List comments")
+    c_list.add_argument("-p", "--project", required=True, help="Project ID")
+    c_list.add_argument("-i", "--issue", required=True, help="Issue ID")
+    c_list.add_argument("--all", action="store_true", help="Show all activity")
+    c_list.set_defaults(func=cmd_comments_list)
+    
+    c_add = cmt_sub.add_parser("add", help="Add comment")
+    c_add.add_argument("-p", "--project", required=True, help="Project ID")
+    c_add.add_argument("-i", "--issue", required=True, help="Issue ID")
+    c_add.add_argument("body", help="Comment text")
+    c_add.set_defaults(func=cmd_comments_add)
+    
+    st_p = subparsers.add_parser("states", help="List states")
+    st_p.add_argument("-p", "--project", required=True, help="Project ID")
+    st_p.set_defaults(func=cmd_states)
+    
+    lbl_p = subparsers.add_parser("labels", help="List labels")
+    lbl_p.add_argument("-p", "--project", required=True, help="Project ID")
+    lbl_p.set_defaults(func=cmd_labels)
+    
+    cyc = subparsers.add_parser("cycles", help="Manage cycles")
+    cyc_sub = cyc.add_subparsers(dest="subcommand")
+    cy_list = cyc_sub.add_parser("list", help="List cycles")
+    cy_list.add_argument("-p", "--project", required=True, help="Project ID")
+    cy_list.set_defaults(func=cmd_cycles_list)
+    cy_get = cyc_sub.add_parser("get", help="Get cycle")
+    cy_get.add_argument("-p", "--project", required=True, help="Project ID")
+    cy_get.add_argument("cycle", help="Cycle ID")
+    cy_get.set_defaults(func=cmd_cycles_get)
+    
+    mod = subparsers.add_parser("modules", help="Manage modules")
+    mod_sub = mod.add_subparsers(dest="subcommand")
+    m_list = mod_sub.add_parser("list", help="List modules")
+    m_list.add_argument("-p", "--project", required=True, help="Project ID")
+    m_list.set_defaults(func=cmd_modules_list)
+    m_get = mod_sub.add_parser("get", help="Get module")
+    m_get.add_argument("-p", "--project", required=True, help="Project ID")
+    m_get.add_argument("module", help="Module ID")
+    m_get.set_defaults(func=cmd_modules_get)
+    
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        for action in parser._subparsers._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                sub = action.choices.get(args.command)
+                if sub:
+                    sub.print_help()
+                    break
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
