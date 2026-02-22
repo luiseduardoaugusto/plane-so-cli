@@ -21,7 +21,7 @@ from urllib.parse import urlencode
 # Configuration
 API_KEY = os.environ.get("PLANE_API_KEY")
 WORKSPACE = os.environ.get("PLANE_WORKSPACE")
-BASE_URL = os.environ.get("PLANE_BASE_URL", "https://api.plane.so")
+BASE_URL = "https://api.plane.so"
 
 # Colors
 _COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
